@@ -1,1 +1,1663 @@
 
+#!/usr/bin/env python3
+"""
+NYAO SCALPER ANALYSIS PORT - EXECUTION VERSION
+
+This version:
+- keeps the same config sections: [mt5], [trading], [telegram]
+- uses the nyao_scalper-style analysis/scoring ported to Python
+- executes market orders directly on valid signals
+- uses fixed execution settings by default:
+    lot = 0.10
+    take profit target = Rp 80,000 gross
+    stop loss target = Rp 180,000 gross
+    USD/IDR = 16,900
+- keeps Telegram notifications, but adjusted for live execution events
+
+No pending orders in this version.
+"""
+
+import os
+import time
+import json
+from collections import OrderedDict
+import math
+import configparser
+import urllib.request
+import urllib.parse
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Optional
+
+import MetaTrader5 as mt5
+import numpy as np
+
+CONFIG_PATH = os.getenv("MOMENTUM_CONFIG", "execute_config.ini")
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+def load_config(path: str):
+    cp = configparser.ConfigParser()
+    cp.read(path, encoding="utf-8")
+    return cp
+
+CFG_RAW = load_config(CONFIG_PATH)
+
+def cfg_get(section: str, key: str, default: str) -> str:
+    try:
+        return CFG_RAW.get(section, key, fallback=default)
+    except Exception:
+        return default
+
+def cfg_getint(section: str, key: str, default: int) -> int:
+    try:
+        return CFG_RAW.getint(section, key, fallback=default)
+    except Exception:
+        return default
+
+def cfg_getfloat(section: str, key: str, default: float) -> float:
+    try:
+        return CFG_RAW.getfloat(section, key, fallback=default)
+    except Exception:
+        return default
+
+def cfg_getbool(section: str, key: str, default: bool) -> bool:
+    try:
+        return CFG_RAW.getboolean(section, key, fallback=default)
+    except Exception:
+        return default
+
+
+class CFG:
+    login = cfg_getint("mt5", "login", 0)
+    password = cfg_get("mt5", "password", "")
+    server = cfg_get("mt5", "server", "")
+
+    symbols = [
+        s.strip()
+        for s in cfg_get("trading", "symbols", "BTCUSD,GBPUSD,EURUSD,XAUUSD").split(",")
+        if s.strip()
+    ]
+    scan_interval = cfg_getint("trading", "scan_interval_seconds", 5)
+    magic = cfg_getint("trading", "magic", 6926268)
+    deviation = cfg_getint("trading", "deviation", 20)
+
+    telegram_enabled = cfg_getbool("telegram", "telegram_enabled", True)
+    telegram_token = cfg_get("telegram", "telegram_bot_token", "")
+    telegram_chat_id = cfg_get("telegram", "telegram_chat_id", "")
+
+    # Keep config structure same, but allow optional overrides if user later adds them
+    fixed_lot = cfg_getfloat("trading", "fixed_lot", cfg_getfloat("trading", "lot", 0.10))
+    take_profit_idr = cfg_getfloat("trading", "take_profit_idr", cfg_getfloat("trading", "tp", 80000.0))
+    stop_loss_idr = cfg_getfloat("trading", "stop_loss_idr", cfg_getfloat("trading", "sl", 180000.0))
+    idr_per_usd = cfg_getfloat("risk", "idr_per_usd", cfg_getfloat("risk", "usd_idr", 16900.0))
+
+    max_open_positions = cfg_getint("trading", "max_open_positions", 8)
+    max_positions_per_symbol = cfg_getint("trading", "max_positions_per_symbol", 1)
+    enable_daily_limits = cfg_getbool("risk", "enable_daily_limits", False)
+    daily_target_idr = cfg_getfloat("risk", "daily_target_idr", 150000.0)
+    daily_max_losses = cfg_getint("risk", "daily_max_losses", 3)
+    max_wins_per_run = cfg_getint("risk", "max_wins_per_run", 1)
+    close_positions_on_stop = cfg_getbool("risk", "close_positions_on_stop", False)
+    cancel_pending_on_stop = cfg_getbool("risk", "cancel_pending_on_stop", True)
+
+    timeframe = mt5.TIMEFRAME_M5
+    bars = 300
+
+    # Nyao-style analysis constants
+    directional_body_lookback = 10
+    ema_fast_period = 5
+    ema_slow_period = 12
+    rsi_period = 8
+    atr_period = 8
+    atr_avg_lookback = 10
+    impulse_lookback = 3
+    impulse_boost_weight = 1.0
+
+    signal_smoothing_candles = 2
+    current_candle_blend = 0.40
+    velocity_window = 2.0
+
+    rsi_overbought = 80
+    rsi_oversold = 20
+    rsi_momentum_buy = 60
+    rsi_momentum_sell = 40
+
+    trend_weight = 1.5
+    slope_weight = 1.5
+    momentum_base_weight = 1.0
+    momentum_trigger_weight = 0.5
+    body_momentum_weight = 1.5
+    chop_score_high = 2.0
+    chop_score_med = 1.0
+    chop_score_low = 0.5
+    volatility_score_high = 1.0
+    volatility_score_low = 0.5
+    peak_score_weight = 1.0
+    wick_rejection_weight = 1.0
+    min_body_ratio = 1.5
+
+    min_buy_signal_score = 5.5
+    min_sell_signal_score = 5.5
+
+    atr_hint_tp_mult = 2.5
+    atr_hint_sl_mult = 1.5
+
+
+PROFILE_PRESETS = {
+    "aggressive": {
+        "DirectionalBodyLookback": 8,
+        "EMAFastPeriod": 4,
+        "EMASlowPeriod": 10,
+        "RSIPeriod": 6,
+        "ATRPeriod": 6,
+        "ATRAvgLookback": 8,
+        "ImpulseLookback": 2,
+        "ImpulseBoostWeight": 1.5,
+        "SignalSmoothingCandles": 1,
+        "CurrentCandleBlend": 0.6,
+        "VelocityWindow": 2.5,
+        "RSIOverbought": 85,
+        "RSIOversold": 15,
+        "RSIMomentumBuy": 55,
+        "RSIMomentumSell": 45,
+        "TrendWeight": 1.5,
+        "SlopeWeight": 1.5,
+        "MomentumBaseWeight": 1.2,
+        "MomentumTriggerWeight": 0.8,
+        "BodyMomentumWeight": 1.8,
+        "ChopScoreHigh": 2.0,
+        "ChopScoreMed": 1.2,
+        "ChopScoreLow": 0.3,
+        "VolatilityScoreHigh": 1.0,
+        "VolatilityScoreLow": 0.5,
+        "PeakScoreWeight": 1.0,
+        "WickRejectionWeight": 0.5,
+        "MinBodyRatio": 1.2,
+        "EnableBuyOrders": True,
+        "EnableSellOrders": True,
+        "MinBuySignalScore": 4.5,
+        "MinSellSignalScore": 4.5
+    },
+    "balanced": {
+        "DirectionalBodyLookback": 12,
+        "EMAFastPeriod": 5,
+        "EMASlowPeriod": 14,
+        "RSIPeriod": 8,
+        "ATRPeriod": 8,
+        "ATRAvgLookback": 12,
+        "ImpulseLookback": 3,
+        "ImpulseBoostWeight": 1.0,
+        "SignalSmoothingCandles": 2,
+        "CurrentCandleBlend": 0.35,
+        "VelocityWindow": 2.0,
+        "RSIOverbought": 78,
+        "RSIOversold": 22,
+        "RSIMomentumBuy": 58,
+        "RSIMomentumSell": 42,
+        "TrendWeight": 1.5,
+        "SlopeWeight": 1.5,
+        "MomentumBaseWeight": 1.0,
+        "MomentumTriggerWeight": 0.5,
+        "BodyMomentumWeight": 1.5,
+        "ChopScoreHigh": 2.0,
+        "ChopScoreMed": 1.0,
+        "ChopScoreLow": 0.5,
+        "VolatilityScoreHigh": 1.0,
+        "VolatilityScoreLow": 0.5,
+        "PeakScoreWeight": 1.0,
+        "WickRejectionWeight": 1.0,
+        "MinBodyRatio": 1.5,
+        "EnableBuyOrders": True,
+        "EnableSellOrders": True,
+        "MinBuySignalScore": 6.0,
+        "MinSellSignalScore": 6.0
+    },
+    "default": {
+        "DirectionalBodyLookback": 10,
+        "EMAFastPeriod": 5,
+        "EMASlowPeriod": 12,
+        "RSIPeriod": 8,
+        "ATRPeriod": 8,
+        "ATRAvgLookback": 10,
+        "ImpulseLookback": 3,
+        "ImpulseBoostWeight": 1.0,
+        "SignalSmoothingCandles": 2,
+        "CurrentCandleBlend": 0.4,
+        "VelocityWindow": 2.0,
+        "RSIOverbought": 80,
+        "RSIOversold": 20,
+        "RSIMomentumBuy": 60,
+        "RSIMomentumSell": 40,
+        "TrendWeight": 1.5,
+        "SlopeWeight": 1.5,
+        "MomentumBaseWeight": 1.0,
+        "MomentumTriggerWeight": 0.5,
+        "BodyMomentumWeight": 1.5,
+        "ChopScoreHigh": 2.0,
+        "ChopScoreMed": 1.0,
+        "ChopScoreLow": 0.5,
+        "VolatilityScoreHigh": 1.0,
+        "VolatilityScoreLow": 0.5,
+        "PeakScoreWeight": 1.0,
+        "WickRejectionWeight": 1.0,
+        "MinBodyRatio": 1.5,
+        "EnableBuyOrders": True,
+        "EnableSellOrders": True,
+        "MinBuySignalScore": 5.5,
+        "MinSellSignalScore": 5.5
+    },
+    "safe": {
+        "DirectionalBodyLookback": 15,
+        "EMAFastPeriod": 6,
+        "EMASlowPeriod": 16,
+        "RSIPeriod": 10,
+        "ATRPeriod": 10,
+        "ATRAvgLookback": 15,
+        "ImpulseLookback": 4,
+        "ImpulseBoostWeight": 0.8,
+        "SignalSmoothingCandles": 3,
+        "CurrentCandleBlend": 0.25,
+        "VelocityWindow": 2.0,
+        "RSIOverbought": 75,
+        "RSIOversold": 25,
+        "RSIMomentumBuy": 62,
+        "RSIMomentumSell": 38,
+        "TrendWeight": 1.5,
+        "SlopeWeight": 1.5,
+        "MomentumBaseWeight": 1.0,
+        "MomentumTriggerWeight": 0.5,
+        "BodyMomentumWeight": 1.5,
+        "ChopScoreHigh": 2.0,
+        "ChopScoreMed": 1.0,
+        "ChopScoreLow": 0.5,
+        "VolatilityScoreHigh": 1.0,
+        "VolatilityScoreLow": 0.5,
+        "PeakScoreWeight": 1.0,
+        "WickRejectionWeight": 1.5,
+        "MinBodyRatio": 1.8,
+        "EnableBuyOrders": True,
+        "EnableSellOrders": True,
+        "MinBuySignalScore": 7.0,
+        "MinSellSignalScore": 7.0
+    },
+    "safe-aggressive": {
+        "DirectionalBodyLookback": 8,
+        "EMAFastPeriod": 5,
+        "EMASlowPeriod": 11,
+        "RSIPeriod": 7,
+        "ATRPeriod": 7,
+        "ATRAvgLookback": 10,
+        "ImpulseLookback": 3,
+        "ImpulseBoostWeight": 1.2,
+        "SignalSmoothingCandles": 2,
+        "CurrentCandleBlend": 0.45,
+        "VelocityWindow": 2.0,
+        "RSIOverbought": 80,
+        "RSIOversold": 20,
+        "RSIMomentumBuy": 58,
+        "RSIMomentumSell": 42,
+        "TrendWeight": 1.5,
+        "SlopeWeight": 1.5,
+        "MomentumBaseWeight": 1.0,
+        "MomentumTriggerWeight": 0.6,
+        "BodyMomentumWeight": 1.6,
+        "ChopScoreHigh": 2.0,
+        "ChopScoreMed": 1.0,
+        "ChopScoreLow": 0.4,
+        "VolatilityScoreHigh": 1.0,
+        "VolatilityScoreLow": 0.5,
+        "PeakScoreWeight": 1.0,
+        "WickRejectionWeight": 0.8,
+        "MinBodyRatio": 1.3,
+        "EnableBuyOrders": True,
+        "EnableSellOrders": True,
+        "MinBuySignalScore": 5.0,
+        "MinSellSignalScore": 5.0
+    }
+}
+
+ACTIVE_MODE_KEY = "default"
+ACTIVE_MODE_LABEL = "Default"
+
+def profile_get(key: str, fallback):
+    return PROFILE_PRESETS.get(ACTIVE_MODE_KEY, {}).get(key, fallback)
+
+def choose_mode():
+    global ACTIVE_MODE_KEY, ACTIVE_MODE_LABEL
+    menu = {
+        "1": ("aggressive", "Aggresive"),
+        "2": ("balanced", "Balanced"),
+        "3": ("default", "Default"),
+        "4": ("safe", "Safe"),
+        "5": ("safe-aggressive", "Safe-Aggresive"),
+    }
+    print("\nSelect strategy mode:")
+    print("1. Aggresive")
+    print("2. Balanced")
+    print("3. Default")
+    print("4. Safe")
+    print("5. Safe-Aggresive")
+    choice = input("Input 1-5 and press Enter: ").strip()
+    key, label = menu.get(choice, ("default", "Default"))
+    ACTIVE_MODE_KEY = key
+    ACTIVE_MODE_LABEL = label
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Mode selected: {ACTIVE_MODE_LABEL}")
+
+
+# ============================================================
+# LOGGING / FORMAT
+# ============================================================
+
+class Log:
+    @staticmethod
+    def now() -> str:
+        return datetime.now().strftime("%H:%M:%S")
+
+    @staticmethod
+    def info(msg: str) -> None:
+        print(f"[{Log.now()}] [INFO] {msg}")
+
+    @staticmethod
+    def warn(msg: str) -> None:
+        print(f"[{Log.now()}] [WARN] {msg}")
+
+    @staticmethod
+    def err(msg: str) -> None:
+        print(f"[{Log.now()}] [ERR]  {msg}")
+
+    @staticmethod
+    def ok(msg: str) -> None:
+        print(f"[{Log.now()}] [OK]   {msg}")
+
+    @staticmethod
+    def sig(msg: str) -> None:
+        print(f"[{Log.now()}] [SIG]  {msg}")
+
+    @staticmethod
+    def trd(msg: str) -> None:
+        print(f"[{Log.now()}] [TRD]  {msg}")
+
+    @staticmethod
+    def stat(msg: str) -> None:
+        print(f"[{Log.now()}] [STAT] {msg}")
+
+    @staticmethod
+    def head(title: str) -> None:
+        print("=" * 92)
+        print(title)
+        print("=" * 92)
+
+
+def fmt_usd(v: float) -> str:
+    return f"${v:,.2f}"
+
+def fmt_idr(v: float) -> str:
+    return f"Rp {v:,.0f}"
+
+def account_currency() -> str:
+    acc = mt5.account_info()
+    return str(getattr(acc, "currency", "") or "").upper() if acc else ""
+
+def usd_to_idr(v: float) -> float:
+    return float(v) * CFG.idr_per_usd
+
+def money_to_idr_display(v: float) -> float:
+    cur = account_currency()
+    if cur in {"IDR", "RP", "IDR."}:
+        return float(v)
+    return usd_to_idr(v)
+
+def format_reasons(reasons: List[str]) -> str:
+    if not reasons:
+        return "-"
+    return "\n".join(f"• {r}" for r in reasons)
+
+
+def compact_reason_summary(decision: Optional[dict]) -> str:
+    if not decision:
+        return "No setup"
+    reasons = decision.get("reasons", [])
+    if not reasons:
+        buy = float(decision.get("buy_score", 0.0) or 0.0)
+        sell = float(decision.get("sell_score", 0.0) or 0.0)
+        return f"BUY={buy:.2f} SELL={sell:.2f}"
+    parts = []
+    for r in reasons[:3]:
+        clean = str(r).replace("\n", " ").strip()
+        if len(clean) > 88:
+            clean = clean[:85] + "..."
+        parts.append(clean)
+    return " | ".join(parts)
+
+def print_live_status(check_no: int, symbol: str, decision: Optional[dict], extra: str = ""):
+    tag = f"[Check-{check_no:02d}]"
+    if decision is not None:
+        direction = decision.get("direction", "NONE")
+        buy = decision.get("buy_score", 0.0)
+        sell = decision.get("sell_score", 0.0)
+        conf = decision.get("confidence", 0.0)
+        summary = compact_reason_summary(decision)
+        line = f"{tag} {symbol} | {direction} | BUY={buy:.2f} SELL={sell:.2f} CONF={conf:.0f}% | {summary}"
+    else:
+        line = f"{tag} {symbol} | NONE | {extra}".strip()
+    print(line)
+
+
+LIVE_STATUS = OrderedDict()
+
+def set_live_status(check_no: int, symbol: str, decision: Optional[dict], extra: str = ""):
+    tag = f"[Check-{check_no:02d}]"
+    if decision is not None:
+        direction = decision.get("direction", "NONE")
+        buy = float(decision.get("buy_score", 0.0) or 0.0)
+        sell = float(decision.get("sell_score", 0.0) or 0.0)
+        conf = float(decision.get("confidence", 0.0) or 0.0)
+        summary = compact_reason_summary(decision)
+        line = f"{tag} {symbol:<8} | {direction:<4} | BUY={buy:>4.2f} SELL={sell:>4.2f} CONF={conf:>2.0f}% | {summary}"
+    else:
+        line = f"{tag} {symbol:<8} | NONE | {extra}".strip()
+    LIVE_STATUS[symbol] = line
+
+def clear_console():
+    os.system("cls" if os.name == "nt" else "clear")
+
+def render_dashboard(mode_name: str):
+    clear_console()
+    print("=" * 92)
+    print("NYAO SCALPER EXECUTION PORT - LIVE DASHBOARD")
+    print("=" * 92)
+    print(
+        f"[{Log.now()}] Mode={mode_name} | Symbols={','.join(CFG.symbols)} | "
+        f"Scan={CFG.scan_interval}s | Lot={CFG.fixed_lot:.2f} | "
+        f"TP={fmt_idr(CFG.take_profit_idr)} | SL={fmt_idr(CFG.stop_loss_idr)} | FX={CFG.idr_per_usd:,.0f}"
+    )
+    print(f"[{Log.now()}] Realtime screen mode: dashboard redraw (no scrolling spam) | MaxWins/Run={CFG.max_wins_per_run}")
+    acc = mt5.account_info()
+    if acc is not None:
+        realized = session_realized_usd()
+        wins = count_run_wins()
+        losses = count_run_losses()
+        print(
+            f"[{Log.now()}] Balance={acc.balance:.2f} Equity={acc.equity:.2f} "
+            f"OpenPos={len(get_positions())} SessionPnL={realized:.2f} ({fmt_idr(money_to_idr_display(realized))}) "
+            f"W={wins} L={losses}"
+        )
+    print("-" * 92)
+    for symbol in CFG.symbols:
+        print(LIVE_STATUS.get(symbol, f"[Check-00] {symbol:<8} | WAIT | Initializing..."))
+    print("-" * 92)
+    print(f"[{Log.now()}] Press CTRL+C to stop")
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_telegram(message: str) -> bool:
+    if not CFG.telegram_enabled or not CFG.telegram_token or not CFG.telegram_chat_id:
+        return False
+
+    try:
+        url = f"https://api.telegram.org/bot{CFG.telegram_token}/sendMessage"
+        payload = urllib.parse.urlencode({
+            "chat_id": CFG.telegram_chat_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }).encode("utf-8")
+        with urllib.request.urlopen(url, payload, timeout=8) as response:
+            return response.getcode() == 200
+    except Exception as e:
+        Log.warn(f"Telegram send failed: {e}")
+        return False
+
+
+# ============================================================
+# PERSISTENCE
+# ============================================================
+
+def notes_path():
+    return os.getenv("TRADE_NOTES_FILE", "nyao_exec_notes.json")
+
+def load_notes():
+    path = notes_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_notes(notes):
+    with open(notes_path(), "w", encoding="utf-8") as f:
+        json.dump(notes, f, indent=2)
+
+def remember_trade(ticket: int, symbol: str, decision: dict, entry: float, sl: float, tp: float, volume: float):
+    notes = load_notes()
+    notes[str(ticket)] = {
+        "symbol": symbol,
+        "direction": decision.get("direction", "NONE"),
+        "score": decision.get("score", 0.0),
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp": float(tp),
+        "volume": float(volume),
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "reasons": decision.get("reasons", []),
+        "buy_score": decision.get("buy_score", 0.0),
+        "sell_score": decision.get("sell_score", 0.0),
+    }
+    save_notes(notes)
+
+def find_note_for_position(position):
+    notes = load_notes()
+    key = str(getattr(position, "ticket", ""))
+    if key in notes:
+        return notes[key]
+    direction = "BUY" if position.type == mt5.ORDER_TYPE_BUY else "SELL"
+    best = None
+    for item in notes.values():
+        if item.get("symbol") == position.symbol and item.get("direction") == direction:
+            best = item
+    return best
+
+
+# ============================================================
+# MT5 HELPERS
+# ============================================================
+
+def connect() -> bool:
+    if not mt5.initialize():
+        Log.err(f"MT5 initialization failed: {mt5.last_error()}")
+        return False
+
+    if CFG.login > 0 and CFG.password and CFG.server:
+        ok = mt5.login(CFG.login, password=CFG.password, server=CFG.server)
+        if not ok:
+            Log.err(f"MT5 login failed: {mt5.last_error()}")
+            mt5.shutdown()
+            return False
+
+    acc = mt5.account_info()
+    if acc is None:
+        Log.err("Could not read account info")
+        return False
+
+    Log.ok(
+        f"Connected | Balance={acc.balance:.2f} Equity={acc.equity:.2f} "
+        f"Lot={CFG.fixed_lot:.2f} TP={fmt_idr(CFG.take_profit_idr)} SL={fmt_idr(CFG.stop_loss_idr)}"
+    )
+    return True
+
+def shutdown():
+    mt5.shutdown()
+
+def symbol_info_safe(symbol: str):
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return None
+    if not info.visible:
+        mt5.symbol_select(symbol, True)
+        info = mt5.symbol_info(symbol)
+    return info
+
+def get_tick(symbol: str):
+    return mt5.symbol_info_tick(symbol)
+
+def normalize_price(symbol: str, price: float) -> float:
+    info = symbol_info_safe(symbol)
+    digits = getattr(info, "digits", 5) if info else 5
+    return round(price, digits)
+
+def get_positions():
+    p = mt5.positions_get()
+    return [] if p is None else [x for x in p if getattr(x, "magic", None) == CFG.magic]
+
+def get_orders():
+    o = mt5.orders_get()
+    return [] if o is None else [x for x in o if getattr(x, "magic", None) == CFG.magic]
+
+def today_deals():
+    start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    deals = mt5.history_deals_get(start, datetime.now())
+    if deals is None:
+        return []
+    return [d for d in deals if getattr(d, "magic", None) == CFG.magic]
+
+def fetch_data(symbol: str, timeframe: int = mt5.TIMEFRAME_M5, bars: int = 300) -> Optional[Dict]:
+    try:
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            Log.info(f"{symbol}: symbol not found in MT5")
+            return None
+        if not info.visible:
+            if not mt5.symbol_select(symbol, True):
+                Log.info(f"{symbol}: symbol_select failed")
+                return None
+        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, bars)
+        if rates is None:
+            Log.info(f"{symbol}: copy_rates_from_pos returned None | last_error={mt5.last_error()}")
+            return None
+        if len(rates) == 0:
+            Log.info(f"{symbol}: no bars returned for timeframe={timeframe}")
+            return None
+
+        rates = rates[::-1]
+        return {
+            "open": np.array([r["open"] for r in rates], dtype=float),
+            "close": np.array([r["close"] for r in rates], dtype=float),
+            "high": np.array([r["high"] for r in rates], dtype=float),
+            "low": np.array([r["low"] for r in rates], dtype=float),
+            "volume": np.array([r["tick_volume"] for r in rates], dtype=float),
+            "rates": rates,
+        }
+    except Exception as e:
+        Log.info(f"{symbol}: Data fetch failed - {e}")
+        return None
+
+def filling_mode_name(mode: int) -> str:
+    if mode == mt5.ORDER_FILLING_FOK:
+        return "FOK"
+    if mode == mt5.ORDER_FILLING_IOC:
+        return "IOC"
+    if mode == mt5.ORDER_FILLING_RETURN:
+        return "RETURN"
+    return str(mode)
+
+def get_filling_mode_candidates(symbol: str):
+    """
+    Build a safe list of fill modes to try.
+    Many brokers reject one mode but accept another.
+    """
+    info = symbol_info_safe(symbol)
+    broker_mode = int(getattr(info, "filling_mode", 0) or 0) if info else 0
+    candidates = []
+
+    if broker_mode == 1:
+        candidates.append(mt5.ORDER_FILLING_FOK)
+    elif broker_mode == 2:
+        candidates.append(mt5.ORDER_FILLING_IOC)
+    elif broker_mode == 3:
+        candidates.append(mt5.ORDER_FILLING_RETURN)
+
+    for mode in (mt5.ORDER_FILLING_RETURN, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK):
+        if mode not in candidates:
+            candidates.append(mode)
+
+    return candidates
+
+
+
+# ============================================================
+# ANALYSIS PORT (NYAO STYLE)
+# ============================================================
+
+@dataclass
+class SignalStrength:
+    final_score: float = 0.0
+    trend_score: float = 0.0
+    momentum_score: float = 0.0
+    chop_score: float = 0.0
+    peak_score: float = 0.0
+    volatility_score: float = 0.0
+    impulse_strength: float = 0.0
+    velocity: float = 0.0
+    normalized_velocity: float = 0.0
+    avg_body: float = 0.0
+    body_signal: float = 0.0
+    upper_wick: float = 0.0
+    lower_wick: float = 0.0
+    rejection: float = 0.0
+    penalty_wick: float = 0.0
+    reasoning: str = ""
+
+
+class NyaoScalperAnalyzer:
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+        self.last_buy_score_prev = 0.0
+        self.last_sell_score_prev = 0.0
+
+    def _ema(self, data: np.ndarray, period: int) -> np.ndarray:
+        data = np.asarray(data, dtype=float)
+        if len(data) == 0:
+            return np.array([], dtype=float)
+        if period <= 1:
+            return data.copy()
+        ema = np.zeros(len(data), dtype=float)
+        seed_len = min(period, len(data))
+        seed = float(np.mean(data[:seed_len]))
+        ema[:seed_len] = seed
+        alpha = 2.0 / (period + 1.0)
+        for i in range(seed_len, len(data)):
+            ema[i] = alpha * data[i] + (1.0 - alpha) * ema[i - 1]
+        return ema
+
+    def _rsi(self, data: np.ndarray, period: int) -> np.ndarray:
+        data = np.asarray(data, dtype=float)
+        if len(data) < period + 1:
+            return np.full(len(data), 50.0, dtype=float)
+
+        chronological = data[::-1]
+        delta = np.diff(chronological)
+        gain = np.where(delta > 0, delta, 0.0)
+        loss = np.where(delta < 0, -delta, 0.0)
+
+        rsi = np.full(len(chronological), 50.0, dtype=float)
+        avg_gain = np.mean(gain[:period])
+        avg_loss = np.mean(loss[:period])
+
+        for i in range(period, len(gain)):
+            avg_gain = (avg_gain * (period - 1) + gain[i]) / period
+            avg_loss = (avg_loss * (period - 1) + loss[i]) / period
+            if avg_loss == 0:
+                rsi[i + 1] = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi[i + 1] = 100.0 - (100.0 / (1.0 + rs))
+        return rsi[::-1]
+
+    def _atr(self, high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
+        if len(close) < period + 1:
+            return np.zeros(len(close), dtype=float)
+
+        h = high[::-1]
+        l = low[::-1]
+        c = close[::-1]
+
+        tr = np.zeros(len(c), dtype=float)
+        for i in range(1, len(c)):
+            tr[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+
+        atr = np.zeros(len(c), dtype=float)
+        seed_end = min(period, len(c) - 1)
+        if seed_end > 0:
+            atr[seed_end] = np.mean(tr[1:seed_end + 1])
+
+        for i in range(seed_end + 1, len(c)):
+            atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+        return atr[::-1]
+
+    def prepare_bundle(self, data: Dict) -> Dict:
+        return {
+            "ema_fast": self._ema(data["close"], profile_get("EMAFastPeriod", CFG.ema_fast_period)),
+            "ema_slow": self._ema(data["close"], profile_get("EMASlowPeriod", CFG.ema_slow_period)),
+            "rsi": self._rsi(data["close"], profile_get("RSIPeriod", CFG.rsi_period)),
+            "atr": self._atr(data["high"], data["low"], data["close"], profile_get("ATRPeriod", CFG.atr_period)),
+        }
+
+    def compute_raw_score(self, data: Dict, bundle: Dict, direction: str, signal_index: int, fill_components: bool = False):
+        is_buy = direction == "BUY"
+
+        close = data["close"]
+        open_ = data["open"]
+        high = data["high"]
+        low = data["low"]
+        ema_fast_arr = bundle["ema_fast"]
+        ema_slow_arr = bundle["ema_slow"]
+        rsi_arr = bundle["rsi"]
+        atr_arr = bundle["atr"]
+
+        needed = max(profile_get("ImpulseLookback", CFG.impulse_lookback), profile_get("DirectionalBodyLookback", CFG.directional_body_lookback), profile_get("ATRAvgLookback", CFG.atr_avg_lookback)) + 5
+        if len(close) <= signal_index + needed:
+            return 0.0, SignalStrength()
+
+        c = close[signal_index:signal_index + needed]
+        o = open_[signal_index:signal_index + needed]
+        h = high[signal_index:signal_index + needed]
+        l = low[signal_index:signal_index + needed]
+        ema_fast = ema_fast_arr[signal_index:signal_index + 3]
+        ema_slow = ema_slow_arr[signal_index:signal_index + 3]
+        rsi = rsi_arr[signal_index:signal_index + 3]
+        atr = atr_arr[signal_index:signal_index + needed]
+
+        if len(ema_fast) < 2 or len(ema_slow) < 1 or len(rsi) < 1:
+            return 0.0, SignalStrength()
+
+        comp = SignalStrength()
+
+        trend_score = 0.0
+        trend_aligned = (ema_fast[0] > ema_slow[0]) if is_buy else (ema_fast[0] < ema_slow[0])
+        if trend_aligned:
+            trend_score += profile_get("TrendWeight", CFG.trend_weight)
+        slope_aligned = (ema_fast[0] > ema_fast[1]) if is_buy else (ema_fast[0] < ema_fast[1])
+        if slope_aligned:
+            trend_score += profile_get("SlopeWeight", CFG.slope_weight)
+        trend_score = min(trend_score, 3.0)
+
+        current_body = abs(c[0] - o[0])
+        past_bodies = [abs(c[i] - o[i]) for i in range(1, min(profile_get("DirectionalBodyLookback", CFG.directional_body_lookback), len(c) - 1) + 1)]
+        avg_recent_body = float(np.mean(past_bodies)) if past_bodies else current_body
+
+        rsi_val = float(rsi[0])
+        base_momentum = 0.0
+        if is_buy:
+            if 50 < rsi_val < profile_get("RSIOverbought", CFG.rsi_overbought):
+                base_momentum += profile_get("MomentumBaseWeight", CFG.momentum_base_weight)
+            if rsi_val > profile_get("RSIMomentumBuy", CFG.rsi_momentum_buy):
+                base_momentum += profile_get("MomentumTriggerWeight", CFG.momentum_trigger_weight)
+            if current_body > avg_recent_body:
+                base_momentum += profile_get("BodyMomentumWeight", CFG.body_momentum_weight)
+        else:
+            if profile_get("RSIOversold", CFG.rsi_oversold) < rsi_val < 50:
+                base_momentum += profile_get("MomentumBaseWeight", CFG.momentum_base_weight)
+            if rsi_val < profile_get("RSIMomentumSell", CFG.rsi_momentum_sell):
+                base_momentum += profile_get("MomentumTriggerWeight", CFG.momentum_trigger_weight)
+            if current_body > avg_recent_body:
+                base_momentum += profile_get("BodyMomentumWeight", CFG.body_momentum_weight)
+
+        momentum_score = base_momentum
+
+        body_accel = min((current_body / avg_recent_body) if avg_recent_body > 0 else 0.0, 3.0)
+        current_range = h[0] - l[0]
+        past_ranges = [(h[i] - l[i]) for i in range(1, min(profile_get("DirectionalBodyLookback", CFG.directional_body_lookback), len(h) - 1) + 1)]
+        avg_recent_range = float(np.mean(past_ranges)) if past_ranges else current_range
+        range_accel = min((current_range / avg_recent_range) if avg_recent_range > 0 else 0.0, 3.0)
+
+        same_dir_count = 0
+        max_look = min(profile_get("ImpulseLookback", CFG.impulse_lookback), len(c))
+        for i in range(max_look):
+            if is_buy and c[i] > o[i]:
+                same_dir_count += 1
+            elif (not is_buy) and c[i] < o[i]:
+                same_dir_count += 1
+            else:
+                break
+
+        continuity_score = min(float(same_dir_count) / max(profile_get("ImpulseLookback", CFG.impulse_lookback), 1), 1.0)
+        raw_impulse = (0.5 * body_accel + 0.3 * range_accel + 0.2 * continuity_score) / 2.0
+        raw_impulse = min(max(raw_impulse, 0.0), 1.0)
+        momentum_score = min(momentum_score * (1.0 + raw_impulse * profile_get("ImpulseBoostWeight", CFG.impulse_boost_weight)), 3.0)
+
+        current_atr = float(atr[0])
+        avg_atr = float(np.mean(atr[:min(profile_get("ATRAvgLookback", CFG.atr_avg_lookback), len(atr))])) if len(atr) > 0 else 0.0
+        vol_ratio = (current_atr / avg_atr) if avg_atr > 0 else 0.0
+
+        if vol_ratio > 1.0:
+            chop_score = profile_get("ChopScoreHigh", CFG.chop_score_high)
+        elif vol_ratio > 0.8:
+            chop_score = profile_get("ChopScoreMed", CFG.chop_score_med)
+        else:
+            chop_score = profile_get("ChopScoreLow", CFG.chop_score_low)
+        chop_score = min(chop_score, 2.0)
+
+        volatility_score = profile_get("VolatilityScoreHigh", CFG.volatility_score_high) if vol_ratio > 1.2 else profile_get("VolatilityScoreLow", CFG.volatility_score_low)
+
+        local_extreme = h[1] if is_buy else l[1]
+        upper = min(6, len(h))
+        for i in range(2, upper):
+            if is_buy:
+                local_extreme = max(local_extreme, h[i])
+            else:
+                local_extreme = min(local_extreme, l[i])
+        breakout = (c[0] > local_extreme) if is_buy else (c[0] < local_extreme)
+        peak_score = profile_get("PeakScoreWeight", CFG.peak_score_weight) if breakout else 0.0
+
+        max_open_close = max(o[0], c[0])
+        min_open_close = min(o[0], c[0])
+        upper_wick = h[0] - max_open_close
+        lower_wick = min_open_close - l[0]
+        safe_body = max(current_body, avg_recent_body * profile_get("MinBodyRatio", CFG.min_body_ratio))
+        rejection = 0.0
+        penalty_wick = 0.0
+        if safe_body > 0:
+            rejection = (upper_wick / safe_body) if is_buy else (lower_wick / safe_body)
+            penalty_wick = rejection * profile_get("WickRejectionWeight", CFG.wick_rejection_weight)
+
+        raw_score = trend_score + momentum_score + chop_score + peak_score + volatility_score - penalty_wick
+        raw_score = min(max(raw_score, 0.0), 10.0)
+
+        if fill_components:
+            comp.trend_score = trend_score
+            comp.momentum_score = momentum_score
+            comp.chop_score = chop_score
+            comp.peak_score = peak_score
+            comp.volatility_score = volatility_score
+            comp.impulse_strength = raw_impulse
+            comp.avg_body = avg_recent_body
+            comp.body_signal = current_body
+            comp.upper_wick = upper_wick
+            comp.lower_wick = lower_wick
+            comp.rejection = rejection
+            comp.penalty_wick = penalty_wick
+
+        return raw_score, comp
+
+    def get_signal_strength(self, data: Dict, bundle: Dict, direction: str) -> SignalStrength:
+        is_buy = direction == "BUY"
+        n = min(max(profile_get("SignalSmoothingCandles", CFG.signal_smoothing_candles), 1), 10)
+        blend = min(max(profile_get("CurrentCandleBlend", CFG.current_candle_blend), 0.0), 1.0)
+
+        strength = SignalStrength()
+        weighted_sum = 0.0
+        weight_total = 0.0
+
+        for i in range(1, n + 1):
+            score_i, comps = self.compute_raw_score(data, bundle, direction, i, fill_components=(i == 1))
+            if i == 1:
+                strength = comps
+            weight = float(n - i + 1)
+            weighted_sum += score_i * weight
+            weight_total += weight
+
+        base_score = (weighted_sum / weight_total) if weight_total > 0 else 0.0
+        current_score, _ = self.compute_raw_score(data, bundle, direction, 0, fill_components=False)
+        final_score = min(max(base_score * (1.0 - blend) + current_score * blend, 0.0), 10.0)
+        strength.final_score = final_score
+
+        prev_score = self.last_buy_score_prev if is_buy else self.last_sell_score_prev
+        velocity = final_score - prev_score
+        strength.velocity = velocity
+        strength.normalized_velocity = min(max((velocity + profile_get("VelocityWindow", CFG.velocity_window)) / (2.0 * profile_get("VelocityWindow", CFG.velocity_window)), 0.0), 1.0)
+
+        if is_buy:
+            self.last_buy_score_prev = final_score
+        else:
+            self.last_sell_score_prev = final_score
+
+        strength.reasoning = (
+            f"T:{strength.trend_score:.1f} "
+            f"M:{strength.momentum_score:.1f}(Imp:{strength.impulse_strength:.2f}) "
+            f"C:{strength.chop_score:.1f} P:{strength.peak_score:.1f} V:{strength.volatility_score:.1f} "
+            f"| WickPenalty:{strength.penalty_wick:.2f} Vel:{strength.normalized_velocity:.2f}"
+        )
+        return strength
+
+    def analyze(self, data: Dict) -> Optional[dict]:
+        if len(data["close"]) < 60:
+            return None
+
+        bundle = self.prepare_bundle(data)
+        buy_strength = self.get_signal_strength(data, bundle, "BUY")
+        sell_strength = self.get_signal_strength(data, bundle, "SELL")
+
+        current_price = float(data["close"][0])
+        atr_now = float(bundle["atr"][0]) if len(bundle["atr"]) > 0 else current_price * 0.01
+
+        reasons = [
+            f"BUY score {buy_strength.final_score:.2f} vs min {profile_get('MinBuySignalScore', CFG.min_buy_signal_score):.2f} -> {buy_strength.reasoning}",
+            f"SELL score {sell_strength.final_score:.2f} vs min {profile_get('MinSellSignalScore', CFG.min_sell_signal_score):.2f} -> {sell_strength.reasoning}",
+        ]
+
+        if profile_get("EnableBuyOrders", True) and buy_strength.final_score >= profile_get("MinBuySignalScore", CFG.min_buy_signal_score) and buy_strength.final_score > sell_strength.final_score:
+            reasons.append(
+                f"BUY selected because buy score {buy_strength.final_score:.2f} exceeded threshold "
+                f"and stayed above sell score {sell_strength.final_score:.2f}."
+            )
+            return {
+                "symbol": self.symbol,
+                "direction": "BUY",
+                "score": buy_strength.final_score,
+                "buy_score": buy_strength.final_score,
+                "sell_score": sell_strength.final_score,
+                "entry_hint": current_price,
+                "atr_hint": atr_now,
+                "confidence": min(95.0, (buy_strength.final_score / 10.0) * 100.0),
+                "momentum_name": "Nyao Scalper Bullish Signal",
+                "reasons": reasons,
+                "indicators_used": [
+                    "EMA Fast/Slow Alignment", "EMA Slope", "RSI Momentum Gate",
+                    "Body Momentum", "Impulse/Continuity", "ATR Chop/Volatility",
+                    "Local Breakout", "Wick Rejection", "Closed-Candle Smoothing + Current Candle Blend"
+                ],
+            }
+
+        if profile_get("EnableSellOrders", True) and sell_strength.final_score >= profile_get("MinSellSignalScore", CFG.min_sell_signal_score) and sell_strength.final_score > buy_strength.final_score:
+            reasons.append(
+                f"SELL selected because sell score {sell_strength.final_score:.2f} exceeded threshold "
+                f"and stayed above buy score {buy_strength.final_score:.2f}."
+            )
+            return {
+                "symbol": self.symbol,
+                "direction": "SELL",
+                "score": sell_strength.final_score,
+                "buy_score": buy_strength.final_score,
+                "sell_score": sell_strength.final_score,
+                "entry_hint": current_price,
+                "atr_hint": atr_now,
+                "confidence": min(95.0, (sell_strength.final_score / 10.0) * 100.0),
+                "momentum_name": "Nyao Scalper Bearish Signal",
+                "reasons": reasons,
+                "indicators_used": [
+                    "EMA Fast/Slow Alignment", "EMA Slope", "RSI Momentum Gate",
+                    "Body Momentum", "Impulse/Continuity", "ATR Chop/Volatility",
+                    "Local Breakout", "Wick Rejection", "Closed-Candle Smoothing + Current Candle Blend"
+                ],
+            }
+        return {
+            "symbol": self.symbol,
+            "direction": "NONE",
+            "score": 0.0,
+            "buy_score": buy_strength.final_score,
+            "sell_score": sell_strength.final_score,
+            "confidence": 0.0,
+            "momentum_name": "No execution setup",
+            "reasons": [
+                f"BUY {buy_strength.final_score:.2f} / {CFG.min_buy_signal_score:.2f} threshold",
+                f"SELL {sell_strength.final_score:.2f} / {CFG.min_sell_signal_score:.2f} threshold",
+                "Selected mode filters are not aligned strongly enough yet",
+            ],
+            "indicators_used": [],
+            "no_execute": True,
+        }
+
+
+
+# ============================================================
+# ORDER / PNL LOGIC
+# ============================================================
+
+def existing_symbol_positions(symbol: str, direction: str):
+    desired_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
+    return [p for p in get_positions() if p.symbol == symbol and p.type == desired_type]
+
+def total_open_positions():
+    return len(get_positions())
+
+def target_money_in_account_ccy(target_idr: float) -> float:
+    cur = account_currency()
+    if cur in {"IDR", "RP", "IDR."}:
+        return float(target_idr)
+    return float(target_idr) / max(CFG.idr_per_usd, 1e-9)
+
+def estimate_price_from_money(symbol: str, direction: str, entry: float, volume: float, target_money_idr: float, fallback_atr: float, fallback_mult: float) -> float:
+    info = symbol_info_safe(symbol)
+    digits = getattr(info, "digits", 5) if info else 5
+    tick_val = float(getattr(info, "trade_tick_value", 0) or 0) if info else 0.0
+    tick_size = float(getattr(info, "trade_tick_size", 0) or 0) if info else 0.0
+
+    if tick_val > 0 and tick_size > 0 and volume > 0:
+        target_money = target_money_in_account_ccy(target_money_idr)
+        price_move = (target_money * tick_size) / max(tick_val * volume, 1e-9)
+        if direction == "BUY":
+            return round(entry + price_move, digits)
+        return round(entry - price_move, digits)
+
+    if direction == "BUY":
+        return round(entry + fallback_atr * fallback_mult, digits)
+    return round(entry - fallback_atr * fallback_mult, digits)
+
+def estimate_sl_price_from_money(symbol: str, direction: str, entry: float, volume: float, stop_money_idr: float, fallback_atr: float, fallback_mult: float) -> float:
+    info = symbol_info_safe(symbol)
+    digits = getattr(info, "digits", 5) if info else 5
+    tick_val = float(getattr(info, "trade_tick_value", 0) or 0) if info else 0.0
+    tick_size = float(getattr(info, "trade_tick_size", 0) or 0) if info else 0.0
+
+    if tick_val > 0 and tick_size > 0 and volume > 0:
+        stop_money = target_money_in_account_ccy(stop_money_idr)
+        price_move = (stop_money * tick_size) / max(tick_val * volume, 1e-9)
+        if direction == "BUY":
+            return round(entry - price_move, digits)
+        return round(entry + price_move, digits)
+
+    if direction == "BUY":
+        return round(entry - fallback_atr * fallback_mult, digits)
+    return round(entry + fallback_atr * fallback_mult, digits)
+
+def place_trade_from_decision(decision: dict):
+    symbol = decision["symbol"]
+    direction = decision["direction"]
+
+    if total_open_positions() >= CFG.max_open_positions:
+        Log.warn("Max open positions reached, no new trade")
+        return
+
+    if len(existing_symbol_positions(symbol, direction)) >= CFG.max_positions_per_symbol:
+        Log.warn(f"{symbol}: same-direction position already exists")
+        return
+
+    tick = get_tick(symbol)
+    info = symbol_info_safe(symbol)
+    if tick is None or info is None:
+        Log.warn(f"{symbol}: missing tick/info")
+        return
+
+    volume = float(CFG.fixed_lot)
+    vmin = float(getattr(info, "volume_min", 0.01) or 0.01)
+    vmax = float(getattr(info, "volume_max", 100.0) or 100.0)
+    vstep = float(getattr(info, "volume_step", 0.01) or 0.01)
+    volume = max(vmin, min(vmax, volume))
+    steps = math.floor(volume / vstep)
+    volume = round(max(vmin, steps * vstep), 2)
+
+    if direction == "BUY":
+        entry = float(tick.ask)
+        order_type = mt5.ORDER_TYPE_BUY
+    else:
+        entry = float(tick.bid)
+        order_type = mt5.ORDER_TYPE_SELL
+
+    entry = normalize_price(symbol, entry)
+    tp = estimate_price_from_money(symbol, direction, entry, volume, CFG.take_profit_idr, decision["atr_hint"], CFG.atr_hint_tp_mult)
+    sl = estimate_sl_price_from_money(symbol, direction, entry, volume, CFG.stop_loss_idr, decision["atr_hint"], CFG.atr_hint_sl_mult)
+
+    base_req = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": volume,
+        "type": order_type,
+        "price": entry,
+        "sl": sl,
+        "tp": tp,
+        "deviation": CFG.deviation,
+        "magic": CFG.magic,
+        "comment": f"nyao_exec|{decision['score']:.2f}",
+        "type_time": mt5.ORDER_TIME_GTC,
+    }
+
+    Log.sig(
+        f"{symbol}: EXECUTE {direction} | entry={entry} tp={tp} sl={sl} vol={volume:.2f} "
+        f"TP={fmt_idr(CFG.take_profit_idr)} SL={fmt_idr(CFG.stop_loss_idr)}"
+    )
+    for r in decision["reasons"]:
+        Log.sig(f"{symbol}: reason -> {r}")
+
+    candidates = get_filling_mode_candidates(symbol)
+    broker_fill = int(getattr(info, "filling_mode", 0) or 0)
+    Log.info(
+        f"{symbol}: trying filling modes {', '.join(filling_mode_name(x) for x in candidates)} "
+        f"| broker_fill_mode={broker_fill} vol_min={vmin} vol_step={vstep} vol_max={vmax}"
+    )
+
+    last_check = None
+    for fill_mode in candidates:
+        req = dict(base_req)
+        req["type_filling"] = fill_mode
+
+        check = mt5.order_check(req)
+        last_check = check
+        if check is None:
+            Log.warn(f"{symbol}: order_check returned None for fill={filling_mode_name(fill_mode)}")
+            continue
+
+        if getattr(check, "retcode", 0) not in (0, mt5.TRADE_RETCODE_DONE):
+            Log.warn(
+                f"{symbol}: order_check failed retcode={check.retcode} "
+                f"comment={getattr(check, 'comment', '')} fill={filling_mode_name(fill_mode)}"
+            )
+            continue
+
+        result = mt5.order_send(req)
+        if result is None:
+            Log.warn(f"{symbol}: order_send returned None for fill={filling_mode_name(fill_mode)}")
+            continue
+
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            remember_trade(result.order, symbol, decision, entry, sl, tp, volume)
+            Log.trd(
+                f"ORDER EXECUTED | {symbol} {direction} ticket={result.order} "
+                f"fill={filling_mode_name(fill_mode)}"
+            )
+            tg_trade_executed(symbol, direction, decision, entry, sl, tp, volume)
+            return
+
+        Log.warn(
+            f"{symbol}: order_send failed retcode={result.retcode} "
+            f"comment={getattr(result, 'comment', '')} fill={filling_mode_name(fill_mode)}"
+        )
+
+    if last_check is not None:
+        Log.warn(
+            f"{symbol}: all filling modes failed | last retcode={getattr(last_check, 'retcode', None)} "
+            f"comment={getattr(last_check, 'comment', '')}"
+        )
+    else:
+        Log.warn(f"{symbol}: all filling mode attempts failed before valid order_check")
+
+
+def daily_realized_usd():
+    exits = [d for d in today_deals() if getattr(d, "entry", None) == 1]
+    return float(sum(float(getattr(d, "profit", 0.0) or 0.0) + float(getattr(d, "swap", 0.0) or 0.0) + float(getattr(d, "commission", 0.0) or 0.0) for d in exits))
+
+def daily_win_loss_counts():
+    exits = [d for d in today_deals() if getattr(d, "entry", None) == 1]
+    wins, losses = 0, 0
+    for d in exits:
+        pnl = float(getattr(d, "profit", 0.0) or 0.0) + float(getattr(d, "swap", 0.0) or 0.0) + float(getattr(d, "commission", 0.0) or 0.0)
+        if pnl > 0:
+            wins += 1
+        elif pnl < 0:
+            losses += 1
+    return wins, losses
+
+def close_all_positions():
+    for p in get_positions():
+        tick = get_tick(p.symbol)
+        if tick is None:
+            continue
+        if p.type == mt5.ORDER_TYPE_BUY:
+            typ = mt5.ORDER_TYPE_SELL
+            price = tick.bid
+        else:
+            typ = mt5.ORDER_TYPE_BUY
+            price = tick.ask
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": p.symbol,
+            "volume": p.volume,
+            "type": typ,
+            "position": p.ticket,
+            "price": price,
+            "deviation": CFG.deviation,
+            "magic": CFG.magic,
+            "comment": "daily_limit_close",
+            "type_filling": current_filling_mode(p.symbol),
+        }
+        mt5.order_send(req)
+
+
+
+def count_run_losses():
+    losses = 0
+    for d in today_deals():
+        if getattr(d, "entry", None) != 1:
+            continue
+        d_time = int(getattr(d, "time", 0) or 0)
+        if d_time <= BOT_START_TS:
+            continue
+        pnl = float(getattr(d, "profit", 0.0) or 0.0) + float(getattr(d, "swap", 0.0) or 0.0) + float(getattr(d, "commission", 0.0) or 0.0)
+        if pnl < 0:
+            losses += 1
+    return losses
+
+def session_realized_usd():
+    total = 0.0
+    for d in today_deals():
+        if getattr(d, "entry", None) != 1:
+            continue
+        d_time = int(getattr(d, "time", 0) or 0)
+        if d_time <= BOT_START_TS:
+            continue
+        total += float(getattr(d, "profit", 0.0) or 0.0) + float(getattr(d, "swap", 0.0) or 0.0) + float(getattr(d, "commission", 0.0) or 0.0)
+    return float(total)
+
+def count_run_wins():
+    wins = 0
+    for d in today_deals():
+        if getattr(d, "entry", None) != 1:
+            continue
+        d_time = int(getattr(d, "time", 0) or 0)
+        if d_time <= BOT_START_TS:
+            continue
+        pnl = float(getattr(d, "profit", 0.0) or 0.0) + float(getattr(d, "swap", 0.0) or 0.0) + float(getattr(d, "commission", 0.0) or 0.0)
+        if pnl > 0:
+            wins += 1
+    return wins
+
+def maybe_stop_for_run_win_limit():
+    global RUN_STOPPED_BY_MAX_WINS
+    if CFG.max_wins_per_run <= 0:
+        return False
+
+    run_wins = count_run_wins()
+    if run_wins >= CFG.max_wins_per_run:
+        if not RUN_STOPPED_BY_MAX_WINS:
+            RUN_STOPPED_BY_MAX_WINS = True
+            Log.warn(f"Max wins reached for this run: {run_wins}/{CFG.max_wins_per_run}")
+            realized = session_realized_usd()
+            wins, losses = count_run_wins(), count_run_losses()
+            tg_bot_stopped(
+                f"max wins reached for this run ({run_wins}/{CFG.max_wins_per_run})",
+                realized,
+                wins,
+                losses
+            )
+        return True
+    return False
+
+def maybe_stop_for_daily_limits():
+    global RUN_STOPPED_BY_DAILY_LIMITS
+    if maybe_stop_for_run_win_limit():
+        return True
+    if not CFG.enable_daily_limits:
+        return False
+
+    realized_usd = session_realized_usd()
+    realized_idr = money_to_idr_display(realized_usd)
+    wins = count_run_wins()
+    losses = count_run_losses()
+
+    if realized_idr >= CFG.daily_target_idr:
+        if not RUN_STOPPED_BY_DAILY_LIMITS:
+            RUN_STOPPED_BY_DAILY_LIMITS = True
+            Log.warn(f"Session target reached: {fmt_idr(realized_idr)}")
+            tg_bot_stopped(f"session target reached ({fmt_idr(realized_idr)})", realized_usd, wins, losses)
+        if CFG.close_positions_on_stop:
+            close_all_positions()
+        return True
+
+    if losses >= CFG.daily_max_losses:
+        if not RUN_STOPPED_BY_DAILY_LIMITS:
+            RUN_STOPPED_BY_DAILY_LIMITS = True
+            Log.warn(f"Session max losses reached: {losses}")
+            tg_bot_stopped(f"session max losses reached ({losses})", realized_usd, wins, losses)
+        if CFG.close_positions_on_stop:
+            close_all_positions()
+        return True
+
+    return False
+
+
+# ============================================================
+# TELEGRAM EXECUTION FORMAT
+# ============================================================
+
+def tg_trade_executed(symbol, direction, decision, entry, sl, tp, volume):
+    icon = "🟢"
+    msg = (
+        f"{icon} MARKET ORDER EXECUTED\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"Symbol: {symbol}\n"
+        f"Side: {direction}\n"
+        f"Momentum: {decision.get('momentum_name', 'Nyao Execution')}\n"
+        f"Mode: {ACTIVE_MODE_LABEL}\n"
+        f"Confidence: {decision.get('confidence', 0):.0f}%\n"
+        f"Lot: {volume:.2f}\n"
+        f"Open Price: {entry}\n"
+        f"Take Profit: {tp} ({fmt_idr(CFG.take_profit_idr)})\n"
+        f"Stop Loss: {sl} ({fmt_idr(CFG.stop_loss_idr)})\n"
+        f"Why executed:\n{format_reasons(decision.get('reasons', []))}"
+    )
+    send_telegram(msg)
+
+def tg_position_opened(symbol, direction, entry, sl, tp, volume, note):
+    reasons = note.get("reasons", []) if note else []
+    msg = (
+        f"🚀 POSITION OPENED\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"Symbol: {symbol}\n"
+        f"Side: {direction}\n"
+        f"Lot: {volume:.2f}\n"
+        f"Open Price: {entry}\n"
+        f"Take Profit: {tp}\n"
+        f"Stop Loss: {sl}\n"
+        f"Reason:\n{format_reasons(reasons)}"
+    )
+    send_telegram(msg)
+
+def tg_trade_closed(outcome, symbol, side, open_price, close_price, tp, sl, gross_profit, swap, commission, net_profit, pnl_pct):
+    icon = "✅" if outcome == "TP" else "🛑"
+    title = "TAKE PROFIT HIT" if outcome == "TP" else "STOP LOSS HIT"
+
+    net_profit_idr = money_to_idr_display(net_profit)
+    commission_cut = abs(commission)
+    commission_idr = money_to_idr_display(commission_cut)
+
+    if commission_cut > 1e-9:
+        profit_line = f"💵 PROFIT: {fmt_idr(net_profit_idr)} (Cut Commision {fmt_idr(commission_idr)})"
+    else:
+        profit_line = f"💵 PROFIT: {fmt_idr(net_profit_idr)} (No Cut Commision)"
+
+    msg = (
+        f"{icon} {title}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"Symbol: {symbol}\n"
+        f"Side: {side}\n"
+        f"Open Price: {open_price}\n"
+        f"Close Price: {close_price}\n"
+        f"TP Level: {tp}\n"
+        f"SL Level: {sl}\n"
+        f"{profit_line}\n"
+        f"PnL: {fmt_usd(net_profit)} | {fmt_idr(net_profit_idr)}\n"
+        f"PnL %: {pnl_pct:.2f}%"
+    )
+    send_telegram(msg)
+
+def tg_bot_stopped(reason, realized_usd, wins, losses):
+    msg = (
+        f"⛔ BOT STOPPED\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"Reason: {reason}\n"
+        f"Session PnL: {fmt_usd(realized_usd)} | {fmt_idr(money_to_idr_display(realized_usd))}\n"
+        f"Wins: {wins}\n"
+        f"Losses: {losses}\n"
+        f"Status: No more trades until script is re-run"
+    )
+    send_telegram(msg)
+
+
+# ============================================================
+# WATCHERS
+# ============================================================
+
+OPENED_CACHE = set()
+CLOSED_CACHE = set()
+BOT_START_TS = int(time.time())
+RUN_STOPPED_BY_MAX_WINS = False
+RUN_STOPPED_BY_DAILY_LIMITS = False
+RUN_WIN_HISTORY = set()
+RUN_LOSS_HISTORY = set()
+
+def bootstrap_event_caches():
+    for p in get_positions():
+        OPENED_CACHE.add(p.ticket)
+    for d in today_deals():
+        d_time = int(getattr(d, "time", 0) or 0)
+        if getattr(d, "entry", None) == 1 and d_time <= BOT_START_TS:
+            CLOSED_CACHE.add((d.ticket, d.position_id, d.time))
+
+def notify_position_opened_if_new():
+    for p in get_positions():
+        if p.ticket in OPENED_CACHE:
+            continue
+        OPENED_CACHE.add(p.ticket)
+        direction = "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL"
+        note = find_note_for_position(p)
+        Log.trd(f"POSITION OPENED | {p.symbol} {direction} entry={p.price_open}")
+        tg_position_opened(p.symbol, direction, p.price_open, p.sl, p.tp, p.volume, note)
+
+def classify_close_reason_from_deal(deal):
+    close_price = float(getattr(deal, "price", 0.0) or 0.0)
+    symbol = getattr(deal, "symbol", "")
+    position_id = getattr(deal, "position_id", None)
+
+    start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    all_deals = mt5.history_deals_get(start, datetime.now()) or []
+    related_deals = [
+        x for x in all_deals
+        if getattr(x, "magic", None) == CFG.magic and getattr(x, "position_id", None) == position_id
+    ]
+
+    gross_profit = float(sum(float(getattr(x, "profit", 0.0) or 0.0) for x in related_deals))
+    swap = float(sum(float(getattr(x, "swap", 0.0) or 0.0) for x in related_deals))
+    commission = float(sum(float(getattr(x, "commission", 0.0) or 0.0) for x in related_deals))
+    net_profit = gross_profit + swap + commission
+
+    open_price, tp, sl, side = 0.0, 0.0, 0.0, "UNKNOWN"
+
+    entry_deals = [x for x in related_deals if int(getattr(x, "entry", -1) or -1) == 0]
+    if entry_deals:
+        entry_deals = sorted(entry_deals, key=lambda x: int(getattr(x, "time", 0) or 0))
+        first_entry = entry_deals[0]
+        deal_type = int(getattr(first_entry, "type", -1) or -1)
+        if deal_type in (mt5.ORDER_TYPE_BUY, getattr(mt5, "DEAL_TYPE_BUY", 0)):
+            side = "BUY"
+        elif deal_type in (mt5.ORDER_TYPE_SELL, getattr(mt5, "DEAL_TYPE_SELL", 1)):
+            side = "SELL"
+
+        total_vol = sum(float(getattr(x, "volume", 0.0) or 0.0) for x in entry_deals)
+        if total_vol > 0:
+            open_price = sum(float(getattr(x, "price", 0.0) or 0.0) * float(getattr(x, "volume", 0.0) or 0.0) for x in entry_deals) / total_vol
+        else:
+            open_price = float(getattr(first_entry, "price", 0.0) or 0.0)
+
+    hist_orders = mt5.history_orders_get(start, datetime.now()) or []
+    matching_orders = [o for o in hist_orders if getattr(o, "position_id", None) == position_id or getattr(o, "ticket", None) == position_id]
+    if matching_orders:
+        matching_orders = sorted(matching_orders, key=lambda o: int(getattr(o, "time_setup", 0) or 0))
+        base_order = matching_orders[0]
+        if side == "UNKNOWN":
+            order_type = int(getattr(base_order, "type", -1) or -1)
+            if order_type in (mt5.ORDER_TYPE_BUY, mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_BUY_STOP):
+                side = "BUY"
+            elif order_type in (mt5.ORDER_TYPE_SELL, mt5.ORDER_TYPE_SELL_LIMIT, mt5.ORDER_TYPE_SELL_STOP):
+                side = "SELL"
+        if open_price == 0.0:
+            open_price = float(getattr(base_order, "price_open", 0.0) or 0.0)
+        tp = float(getattr(base_order, "tp", 0.0) or 0.0)
+        sl = float(getattr(base_order, "sl", 0.0) or 0.0)
+
+    if open_price == 0.0 or tp == 0.0 or sl == 0.0 or side == "UNKNOWN":
+        notes = load_notes()
+        fallback_note = None
+        for item in notes.values():
+            if item.get("symbol") == symbol:
+                if side == "UNKNOWN" or item.get("direction") == side:
+                    fallback_note = item
+                    break
+        if fallback_note:
+            side = fallback_note.get("direction", side)
+            if open_price == 0.0:
+                open_price = float(fallback_note.get("entry", 0.0) or 0.0)
+            if tp == 0.0:
+                tp = float(fallback_note.get("tp", 0.0) or 0.0)
+            if sl == 0.0:
+                sl = float(fallback_note.get("sl", 0.0) or 0.0)
+
+    info = mt5.symbol_info(symbol)
+    point = float(getattr(info, "point", 0.0) or 0.0) if info else 0.0
+    digits = int(getattr(info, "digits", 5) or 5) if info else 5
+    tol = max(point * 50 if point > 0 else 0.0, abs(open_price) * 0.00005 if open_price else 0.0005)
+
+    if tp and abs(close_price - tp) <= tol:
+        outcome = "TP"
+    elif sl and abs(close_price - sl) <= tol:
+        outcome = "SL"
+    elif gross_profit > 0:
+        outcome = "TP"
+    elif gross_profit < 0:
+        outcome = "SL"
+    else:
+        outcome = "TP" if net_profit >= 0 else "SL"
+
+    pnl_pct = 0.0
+    if open_price > 0:
+        if side == "BUY":
+            pnl_pct = ((close_price - open_price) / open_price) * 100.0
+        elif side == "SELL":
+            pnl_pct = ((open_price - close_price) / open_price) * 100.0
+
+    return {
+        "outcome": outcome,
+        "symbol": symbol,
+        "side": side,
+        "open_price": round(open_price, digits) if open_price else open_price,
+        "close_price": round(close_price, digits) if close_price else close_price,
+        "tp": round(tp, digits) if tp else tp,
+        "sl": round(sl, digits) if sl else sl,
+        "gross_profit": gross_profit,
+        "swap": swap,
+        "commission": commission,
+        "net_profit": net_profit,
+        "pnl_pct": pnl_pct,
+    }
+
+def notify_closed_positions():
+    for d in today_deals():
+        if getattr(d, "entry", None) != 1:
+            continue
+        d_time = int(getattr(d, "time", 0) or 0)
+        if d_time <= BOT_START_TS:
+            continue
+        key = (d.ticket, d.position_id, d.time)
+        if key in CLOSED_CACHE:
+            continue
+        CLOSED_CACHE.add(key)
+        result = classify_close_reason_from_deal(d)
+        Log.trd(f"POSITION CLOSED | {result['symbol']} {result['outcome']} net={result['net_profit']:.2f}")
+        if result["outcome"] == "TP":
+            Log.ok(f"Run win progress: {count_run_wins()}/{CFG.max_wins_per_run} win(s) | Session losses={count_run_losses()}")
+        tg_trade_closed(
+            result["outcome"], result["symbol"], result["side"],
+            result["open_price"], result["close_price"], result["tp"], result["sl"],
+            result["gross_profit"], result["swap"], result["commission"], result["net_profit"], result["pnl_pct"]
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def print_status():
+    acc = mt5.account_info()
+    if acc is None:
+        return
+    realized = daily_realized_usd()
+    wins, losses = daily_win_loss_counts()
+    Log.stat(
+        f"Balance={acc.balance:.2f} Equity={acc.equity:.2f} OpenPos={len(get_positions())} "
+        f"DayPnL={realized:.2f} ({fmt_idr(money_to_idr_display(realized))}) "
+        f"W={wins} L={losses}"
+    )
+
+def main():
+    choose_mode()
+    Log.head("NYAO SCALPER EXECUTION PORT - PYTHON")
+    Log.info(
+        f"Mode={ACTIVE_MODE_LABEL} | Symbols={','.join(CFG.symbols)} | Scan={CFG.scan_interval}s | "
+        f"Lot={CFG.fixed_lot:.2f} | TP={fmt_idr(CFG.take_profit_idr)} | "
+        f"SL={fmt_idr(CFG.stop_loss_idr)} | FX={CFG.idr_per_usd:,.0f}"
+    )
+    Log.info("Analysis: EMA alignment + slope + RSI momentum + body/impulse + ATR chop/volatility + breakout + wick penalty")
+    Log.info(f"Strategy profile from .set: {ACTIVE_MODE_LABEL}")
+    Log.info("Config keys: [trading] symbols, fixed_lot/lot, take_profit_idr/tp, stop_loss_idr/sl | [risk] idr_per_usd/usd_idr")
+    Log.info("Console output: compact realtime updates with [Check-Number-XX] and short reasoning")
+    Log.info(f"Run stop rule: max_wins_per_run={CFG.max_wins_per_run} | Bot stops after that many new wins in this run")
+    Log.info("Session rule: daily target / daily max losses are counted only from this script start; restart resets them")
+
+    if not connect():
+        return
+
+    analyzers = {symbol: NyaoScalperAnalyzer(symbol) for symbol in CFG.symbols}
+    for symbol in CFG.symbols:
+        LIVE_STATUS[symbol] = f"[Check-00] {symbol:<8} | WAIT | Initializing..."
+    bootstrap_event_caches()
+    Log.ok("Execution engine ready")
+
+    try:
+        check_no = 0
+        while True:
+            check_no += 1
+            notify_position_opened_if_new()
+            notify_closed_positions()
+
+            if maybe_stop_for_daily_limits():
+                break
+
+            for symbol in CFG.symbols:
+                if maybe_stop_for_daily_limits():
+                    break
+
+                data = fetch_data(symbol, CFG.timeframe, CFG.bars)
+                if data is None:
+                    set_live_status(check_no, symbol, None, "No data from broker / Market Watch")
+                    render_dashboard(SELECTED_MODE_NAME if 'SELECTED_MODE_NAME' in globals() else 'Custom')
+                    continue
+
+                decision = analyzers[symbol].analyze(data)
+
+                if decision is not None and not decision.get("no_execute", False) and decision.get("direction") in ("BUY", "SELL"):
+                    set_live_status(check_no, symbol, decision)
+                    render_dashboard(SELECTED_MODE_NAME if 'SELECTED_MODE_NAME' in globals() else 'Custom')
+                    place_trade_from_decision(decision)
+                else:
+                    set_live_status(check_no, symbol, decision if decision is not None else None, "No execution setup")
+                    render_dashboard(SELECTED_MODE_NAME if 'SELECTED_MODE_NAME' in globals() else 'Custom')
+
+                time.sleep(0.2)
+
+            time.sleep(CFG.scan_interval)
+
+    except KeyboardInterrupt:
+        Log.warn("Stopped by user")
+    finally:
+        shutdown()
+        Log.ok("Shutdown complete")
+
+
+if __name__ == "__main__":
+    main()
